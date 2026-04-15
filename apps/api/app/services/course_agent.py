@@ -1,230 +1,154 @@
 from __future__ import annotations
 
 import asyncio
-import json
+from dataclasses import dataclass, field
 
+from app.application.course_agent_use_cases import (
+    ArtifactUseCases,
+    ConversationUseCases,
+    CourseAgentSupport,
+    ReviewUseCases,
+    ThreadUseCases,
+)
 from app.audit.logger import AuditService, EventBroker
+from app.core.schemas import ConfirmStepRequest, ModeUpdateRequest, RegenerateRequest, ReviewSubmitRequest, ThreadStatus, UploadCategory
 from app.core.settings import Settings
-from app.core.schemas import AuditEvent, DecisionTrainingRecord, MessageRecord, MessageRole, ReviewSubmitRequest, ThreadStatus
 from app.files.parser import DocumentParser
 from app.storage.thread_store import ThreadStore
 from app.workflows.course_graph import CourseGraph
 
 
+@dataclass
 class CourseAgentService:
-    def __init__(
-        self,
-        *,
-        settings: Settings,
-        store: ThreadStore,
-        broker: EventBroker,
-        audit: AuditService,
-        parser: DocumentParser,
-        graph: CourseGraph,
-    ) -> None:
-        self.settings = settings
-        self.store = store
-        self.broker = broker
-        self.audit = audit
-        self.parser = parser
-        self.graph = graph
+    settings: Settings
+    store: ThreadStore
+    broker: EventBroker
+    audit: AuditService
+    parser: DocumentParser
+    graph: CourseGraph
+    _active_thread_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
 
-    def _spawn(self, coroutine: asyncio.Future) -> None:
+    def __post_init__(self) -> None:
+        support = CourseAgentSupport(
+            store=self.store,
+            broker=self.broker,
+            audit=self.audit,
+            parser=self.parser,
+            graph=self.graph,
+            decision_model_data_dir=str(self.settings.decision_model_data_dir),
+        )
+        self.threads = ThreadUseCases(support=support, settings=self.settings)
+        self.conversation = ConversationUseCases(support=support)
+        self.artifacts = ArtifactUseCases(support=support, settings=self.settings)
+        self.reviews = ReviewUseCases(support=support)
+
+    def _spawn_thread_task(self, thread_id: str, coroutine: asyncio.Future) -> None:
+        existing = self._active_thread_tasks.get(thread_id)
+        if existing and not existing.done():
+            existing.cancel()
+
         task = asyncio.create_task(coroutine)
+        self._active_thread_tasks[thread_id] = task
 
-        def _log_task_result(completed: asyncio.Task) -> None:
+        def _finalize(completed: asyncio.Task) -> None:
+            current = self._active_thread_tasks.get(thread_id)
+            if current is completed:
+                self._active_thread_tasks.pop(thread_id, None)
             try:
                 completed.result()
-            except Exception as exc:  # noqa: BLE001
-                asyncio.create_task(
-                    self.audit.record(
-                        AuditEvent(
-                            thread_id="background-task",
-                            event_type="BACKGROUND_TASK_FAILED",
-                            status="error",
-                            error_code=type(exc).__name__,
-                            payload_summary={"error": str(exc)},
-                        )
-                    )
-                )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
 
-        task.add_done_callback(_log_task_result)
+        task.add_done_callback(_finalize)
 
-    async def create_thread(self, user_id: str = "default-user"):
-        state = await self.store.create_thread(user_id=user_id)
-        state.run_metadata.setdefault("decision_feedback_records", [])
-        await self.audit.record(
-            AuditEvent(
-                thread_id=state.thread_id,
-                user_id=user_id,
-                event_type="THREAD_CREATED",
-                payload_summary={"status": state.status},
-            )
-        )
-        return await self.store.build_summary(state.thread_id)
+    async def create_thread(self):
+        return await self.threads.create_thread()
+
+    async def update_mode(self, thread_id: str, request: ModeUpdateRequest):
+        return await self.threads.update_mode(thread_id, request)
+
+    async def list_threads(self):
+        return await self.threads.list_threads()
+
+    async def confirm_step(self, thread_id: str, request: ConfirmStepRequest):
+        return await self.threads.confirm_step(thread_id, request)
+
+    async def delete_thread(self, thread_id: str) -> None:
+        await self.threads.delete_thread(thread_id)
 
     async def ingest_message(self, thread_id: str, content: str, user_id: str) -> None:
-        state = await self.store.get_thread(thread_id)
-        state.messages.append(MessageRecord(role=MessageRole.USER, content=content))
-        state.status = ThreadStatus.COLLECTING
-        await self.store.save_thread(state)
-        await self.audit.record(
-            AuditEvent(
-                thread_id=thread_id,
-                user_id=user_id,
-                event_type="MESSAGE_RECEIVED",
-                payload_summary={"content_preview": content[:120]},
-            )
-        )
-        await self.broker.publish(
-            thread_id,
-            {
-                "type": "user_message",
-                "thread_id": thread_id,
-                "payload": {"content": content},
-            },
-        )
+        await self.conversation.ingest_message(thread_id, content, user_id)
         if self.settings.app_env == "test":
             await self.graph.run_thread(thread_id)
         else:
-            self._spawn(self.graph.run_thread(thread_id))
+            self._spawn_thread_task(thread_id, self.graph.run_thread(thread_id))
 
-    async def upload_file(self, thread_id: str, filename: str, mime_type: str, content: bytes) -> None:
-        path = self.settings.storage_dir / thread_id
-        path.mkdir(parents=True, exist_ok=True)
-        file_path = path / filename
-        file_path.write_bytes(content)
-        doc = self.parser.parse_file(file_path, mime_type)
-        state = await self.store.get_thread(thread_id)
-        state.source_manifest.append(doc)
-        await self.store.save_thread(state)
-        await self.audit.record(
-            AuditEvent(
-                thread_id=thread_id,
-                event_type="FILE_UPLOADED",
-                artifact_version=state.draft_artifact.version if state.draft_artifact else None,
-                payload_summary={"filename": filename, "status": doc.extract_status},
-            )
-        )
-        await self.audit.record(
-            AuditEvent(
-                thread_id=thread_id,
-                event_type="FILE_PARSED",
-                payload_summary={"filename": filename, "chunks": len(doc.text_chunks)},
-            )
-        )
-        await self.broker.publish(
-            thread_id,
-            {
-                "type": "file_uploaded",
-                "thread_id": thread_id,
-                "payload": doc.model_dump(mode="json"),
-            },
-        )
+    async def update_artifact(self, thread_id: str, markdown: str):
+        return await self.artifacts.update_artifact(thread_id, markdown)
+
+    async def upload_file(self, thread_id: str, filename: str, mime_type: str, content: bytes, category: UploadCategory = UploadCategory.CONTEXT) -> None:
+        await self.artifacts.upload_file(thread_id, filename, mime_type, content, category)
 
     async def retract_last_message(self, thread_id: str) -> None:
-        """Remove the last user message (only when thread is in COLLECTING state)."""
-        state = await self.store.get_thread(thread_id)
-        if not state.messages:
-            return
-        if state.messages[-1].role != MessageRole.USER:
-            return
-        if state.status not in (ThreadStatus.COLLECTING,):
-            return  # don't retract while generating / reviewing
-        state.messages.pop()
-        # also remove the preceding assistant clarification if present
-        if state.messages and state.messages[-1].role == MessageRole.ASSISTANT:
-            state.messages.pop()
-        await self.store.save_thread(state)
-        await self.broker.publish(
-            thread_id,
-            {"type": "message_retracted", "thread_id": thread_id, "payload": {}},
-        )
+        await self.conversation.retract_last_message(thread_id)
+
+    async def replace_last_message(self, thread_id: str, content: str, user_id: str) -> None:
+        await self.conversation.replace_last_message(thread_id, content, user_id)
+        if self.settings.app_env == "test":
+            await self.graph.run_thread(thread_id)
+        else:
+            self._spawn_thread_task(thread_id, self.graph.run_thread(thread_id))
 
     async def pause_thread(self, thread_id: str) -> None:
         state = await self.store.get_thread(thread_id)
-        state.run_metadata["status_before_pause"] = state.status.value
+        state.runtime.pause.status_before_pause = state.status
+        state.runtime.pause.requested = True
+        active_task = self._active_thread_tasks.get(thread_id)
+        if active_task and not active_task.done():
+            active_task.cancel()
+            try:
+                await active_task
+            except asyncio.CancelledError:
+                pass
         state.status = ThreadStatus.PAUSED
         await self.store.save_thread(state)
         await self.audit.record(
-            AuditEvent(
-                thread_id=thread_id,
-                user_id=state.user_id,
-                event_type="THREAD_PAUSED",
-                payload_summary={"status_before_pause": state.run_metadata.get("status_before_pause")},
-            )
+            self.audit_event(thread_id=thread_id, user_id=state.user_id, event_type="THREAD_PAUSED", payload_summary={"status_before_pause": state.runtime.pause.status_before_pause})
         )
+        await self.broker.publish(thread_id, {"type": "thread_paused", "thread_id": thread_id, "payload": {"status_before_pause": state.runtime.pause.status_before_pause}})
 
     async def resume_paused_thread(self, thread_id: str) -> None:
         state = await self.store.get_thread(thread_id)
-        previous = state.run_metadata.get("status_before_pause", ThreadStatus.COLLECTING.value)
-        state.status = ThreadStatus(previous)
+        previous = state.runtime.pause.status_before_pause or ThreadStatus.COLLECTING
+        state.status = previous
+        state.runtime.pause.requested = False
         await self.store.save_thread(state)
-        await self.audit.record(
-            AuditEvent(
-                thread_id=thread_id,
-                user_id=state.user_id,
-                event_type="THREAD_RESUMED",
-                payload_summary={"restored_status": previous},
-            )
-        )
+        await self.audit.record(self.audit_event(thread_id=thread_id, user_id=state.user_id, event_type="THREAD_RESUMED", payload_summary={"restored_status": previous}))
+        await self.broker.publish(thread_id, {"type": "thread_resumed", "thread_id": thread_id, "payload": {"restored_status": previous}})
+        if self.settings.app_env == "test":
+            await self.graph.run_thread(thread_id)
+        else:
+            self._spawn_thread_task(thread_id, self.graph.run_thread(thread_id))
 
     async def get_history(self, thread_id: str):
-        return self.graph.get_state_history(thread_id)
+        return await self.threads.get_history(thread_id)
 
-    async def export_decision_records(self, thread_id: str | None = None) -> list[dict]:
-        if thread_id:
-            state = await self.store.get_thread(thread_id)
-            return state.run_metadata.get("decision_feedback_records", [])
+    async def get_timeline(self, thread_id: str):
+        return await self.threads.get_timeline(thread_id)
 
-        all_records: list[dict] = []
-        for state in self.store._threads.values():  # noqa: SLF001
-            all_records.extend(state.run_metadata.get("decision_feedback_records", []))
-        return all_records
+    async def list_versions(self, thread_id: str):
+        return await self.threads.list_versions(thread_id)
+
+    async def get_artifact_version(self, thread_id: str, version: int):
+        return await self.threads.get_artifact_version(thread_id, version)
+
+    async def export_decision_records(self, thread_id: str | None = None):
+        return await self.reviews.export_decision_records(thread_id)
 
     async def submit_review(self, thread_id: str, batch_id: str, review_request: ReviewSubmitRequest) -> None:
-        state = await self.store.get_thread(thread_id)
-        state.approved_feedback = review_request.review_actions
-        state.status = ThreadStatus.REVISING
-        latest_batch = state.review_batches[-1] if state.review_batches else None
-        suggestions_by_id = {
-            suggestion.suggestion_id: suggestion
-            for suggestion in (latest_batch.suggestions if latest_batch else [])
-        }
-        training_records = state.run_metadata.setdefault("decision_feedback_records", [])
-        conversation_context = "\n".join(message.content for message in state.messages[-6:] if message.role == MessageRole.USER)
-        draft_excerpt = (state.draft_artifact.markdown[:1500] if state.draft_artifact else "")
-        for action in review_request.review_actions:
-            suggestion = suggestions_by_id.get(action.suggestion_id)
-            if not suggestion:
-                continue
-            record = DecisionTrainingRecord(
-                thread_id=thread_id,
-                suggestion_id=action.suggestion_id,
-                criterion_id=suggestion.criterion_id,
-                user_message_context=conversation_context,
-                decision_summary=state.decision_summary,
-                draft_excerpt=draft_excerpt,
-                model_problem=suggestion.problem,
-                model_suggestion=suggestion.suggestion,
-                human_action=action.action.value,
-                edited_suggestion=action.edited_suggestion,
-                reviewer_id=action.reviewer_id,
-            ).model_dump(mode="json")
-            training_records.append(record)
-            self._append_decision_record(record)
-        await self.store.save_thread(state)
-        await self.audit.record(
-            AuditEvent(
-                thread_id=thread_id,
-                user_id=review_request.submitter_id,
-                event_type="REVIEW_ACTION_SUBMITTED",
-                payload_summary={
-                    "review_batch_id": batch_id,
-                    "actions": [item.action for item in review_request.review_actions],
-                },
-            )
-        )
+        await self.reviews.submit_review(thread_id, batch_id, review_request)
         resume_value = {
             "review_batch_id": batch_id,
             "review_actions": [item.model_dump(mode="json") for item in review_request.review_actions],
@@ -233,9 +157,12 @@ class CourseAgentService:
         if self.settings.app_env == "test":
             await self.graph.resume_thread(thread_id, resume_value)
         else:
-            self._spawn(self.graph.resume_thread(thread_id, resume_value))
+            self._spawn_thread_task(thread_id, self.graph.resume_thread(thread_id, resume_value))
 
-    def _append_decision_record(self, record: dict) -> None:
-        output_path = self.settings.decision_model_data_dir / "decision_records.jsonl"
-        with output_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    async def regenerate(self, thread_id: str, request: RegenerateRequest):
+        return await self.artifacts.regenerate(thread_id, request)
+
+    def audit_event(self, *, thread_id: str, user_id: str, event_type: str, payload_summary: dict):
+        from app.core.schemas import AuditEvent
+
+        return AuditEvent(thread_id=thread_id, user_id=user_id, event_type=event_type, payload_summary=payload_summary)

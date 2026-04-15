@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Generic, Literal, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -42,6 +42,46 @@ class HumanReviewActionType(str, Enum):
     REJECT = "reject"
 
 
+class ConstraintKind(str, Enum):
+    REQUIRE = "require"
+    BAN = "ban"
+    PREFER = "prefer"
+
+
+class CourseMode(str, Enum):
+    SINGLE = "single"
+    SERIES = "series"
+
+
+class WorkflowStage(str, Enum):
+    CONTENT = "content_creation"
+    DELIVERY = "delivery"
+
+
+class StepStatus(str, Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+
+
+class UploadCategory(str, Enum):
+    CONTEXT = "context"
+    PACKAGE = "package"
+
+
+class GenerationRunKind(str, Enum):
+    GENERATION = "generation"
+    REVISION = "revision"
+    REVIEW = "review"
+    CLARIFICATION = "clarification"
+
+
+class GenerationRunStatus(str, Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class RequirementSlot(BaseModel):
     slot_id: str
     label: str
@@ -69,6 +109,16 @@ class MessageRecord(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
+class ConversationConstraint(BaseModel):
+    constraint_id: str = Field(default_factory=lambda: uuid4().hex)
+    kind: ConstraintKind
+    instruction: str
+    normalized_instruction: str
+    source_message_id: str | None = None
+    active: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class SourceChunk(BaseModel):
     chunk_id: str = Field(default_factory=lambda: uuid4().hex)
     text: str
@@ -84,12 +134,51 @@ class SourceDocument(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class WorkflowStepState(BaseModel):
+    step_id: str
+    label: str
+    stage: WorkflowStage
+    status: StepStatus = StepStatus.PENDING
+    required_slots: list[str] = Field(default_factory=list)
+    optional_slots: list[str] = Field(default_factory=list)
+    forbidden_topics: list[str] = Field(default_factory=list)
+    needs_review: bool = True
+    confirmed_at: datetime | None = None
+    artifact_id: str | None = None
+
+
+class SavedArtifactRecord(BaseModel):
+    artifact_id: str = Field(default_factory=lambda: uuid4().hex)
+    step_id: str
+    label: str
+    filename: str
+    path: str
+    kind: Literal["generated", "uploaded", "reference"] = "generated"
+    version: int = 1
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class DraftArtifact(BaseModel):
     artifact_id: str = Field(default_factory=lambda: uuid4().hex)
     version: int = 1
     markdown: str
     summary: str
     derived_from_feedback_ids: list[str] = Field(default_factory=list)
+    source_version: int | None = None
+    revision_goal: str | None = None
+    generation_run_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ArtifactVersionDetail(BaseModel):
+    artifact_id: str
+    version: int
+    markdown: str
+    summary: str
+    derived_from_feedback_ids: list[str] = Field(default_factory=list)
+    source_version: int | None = None
+    revision_goal: str | None = None
+    generation_run_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -114,6 +203,7 @@ class ReviewSuggestion(BaseModel):
 
 class ReviewBatch(BaseModel):
     review_batch_id: str = Field(default_factory=lambda: uuid4().hex)
+    step_id: str
     draft_version: int
     total_score: float
     criteria: list[ReviewCriterionResult]
@@ -145,19 +235,102 @@ class ResumePayload(BaseModel):
     submitter_id: str
 
 
+class ClarificationRuntimeState(BaseModel):
+    missing_requirements: list[dict[str, str]] = Field(default_factory=list)
+    next_requirement_to_clarify: str | None = None
+    slot_summary: str = "暂无"
+    latest_user_message: str = ""
+    is_confirmation_reply: bool = False
+
+
+class GenerationSessionState(BaseModel):
+    session_id: str = Field(default_factory=lambda: uuid4().hex)
+    step_id: str | None = None
+    kind: GenerationRunKind = GenerationRunKind.GENERATION
+    source_version: int | None = None
+    revision_goal: str | None = None
+    active_generation_run_id: str | None = None
+    generated_markdown: str = ""
+    source_summary: str = "无上传资料"
+    outline: str = ""
+    cases: list[dict[str, Any]] = Field(default_factory=list)
+    auto_optimization_loops: int = 0
+    review_batch_id: str | None = None
+    started_at: datetime = Field(default_factory=utc_now)
+
+
+class HumanReviewRuntimeState(BaseModel):
+    interrupt_payload: InterruptPayload | None = None
+    resume_payload: ResumePayload | None = None
+
+
+class PauseRuntimeState(BaseModel):
+    requested: bool = False
+    status_before_pause: ThreadStatus | None = None
+
+
+class ThreadRuntimeState(BaseModel):
+    clarification: ClarificationRuntimeState = Field(default_factory=ClarificationRuntimeState)
+    generation_session: GenerationSessionState | None = None
+    pending_manual_revision_request: str | None = None
+    pause: PauseRuntimeState = Field(default_factory=PauseRuntimeState)
+    human_review: HumanReviewRuntimeState = Field(default_factory=HumanReviewRuntimeState)
+
+
 class VersionRecord(BaseModel):
     version: int
     artifact_id: str
+    source_version: int | None = None
+    revision_goal: str | None = None
+    generation_run_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class GenerationRun(BaseModel):
+    run_id: str = Field(default_factory=lambda: uuid4().hex)
+    kind: GenerationRunKind
+    status: GenerationRunStatus = GenerationRunStatus.RUNNING
+    source_version: int | None = None
+    target_version: int | None = None
+    instruction: str | None = None
+    model_provider: str | None = None
+    model_name: str | None = None
+    output_preview: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+
+class TimelineEvent(BaseModel):
+    event_id: str = Field(default_factory=lambda: uuid4().hex)
+    thread_id: str
+    event_type: str
+    title: str
+    detail: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ArtifactUpdateRequest(BaseModel):
+    markdown: str
 
 
 class ThreadSummary(BaseModel):
     thread_id: str
     user_id: str
     status: ThreadStatus
+    title: str = "当前对话"
+    subtitle: str = ""
+    course_mode: CourseMode = CourseMode.SINGLE
+    current_step_id: str = "step_1"
     latest_artifact_version: int | None = None
     review_pending: bool = False
     latest_score: float | None = None
+    active_constraints: list[str] = Field(default_factory=list)
+    pending_review_count: int = 0
+    last_generation_target: str | None = None
+    current_generation_run_id: str | None = None
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class AuditEvent(BaseModel):
@@ -187,17 +360,24 @@ class ThreadState(BaseModel):
     thread_id: str
     user_id: str = "default-user"
     status: ThreadStatus = ThreadStatus.COLLECTING
+    course_mode: CourseMode = CourseMode.SINGLE
+    current_step_id: str = "step_1"
     requirements_confirmed: bool = False
     messages: list[MessageRecord] = Field(default_factory=list)
     requirement_slots: dict[str, RequirementSlot] = Field(default_factory=dict)
+    conversation_constraints: list[ConversationConstraint] = Field(default_factory=list)
     decision_ledger: list[DecisionItem] = Field(default_factory=list)
     decision_summary: str = ""
+    workflow_steps: list[WorkflowStepState] = Field(default_factory=list)
+    saved_artifacts: list[SavedArtifactRecord] = Field(default_factory=list)
     source_manifest: list[SourceDocument] = Field(default_factory=list)
     draft_artifact: DraftArtifact | None = None
     review_batches: list[ReviewBatch] = Field(default_factory=list)
     approved_feedback: list[HumanReviewAction] = Field(default_factory=list)
     version_chain: list[VersionRecord] = Field(default_factory=list)
-    run_metadata: dict[str, Any] = Field(default_factory=dict)
+    generation_runs: list[GenerationRun] = Field(default_factory=list)
+    runtime: ThreadRuntimeState = Field(default_factory=ThreadRuntimeState)
+    run_metadata: dict[str, Any] = Field(default_factory=dict, description="Deprecated compatibility bag. Avoid new business state here.")
 
 
 class ThreadHistoryEntry(BaseModel):
@@ -207,7 +387,7 @@ class ThreadHistoryEntry(BaseModel):
     values: dict[str, Any] = Field(default_factory=dict)
 
 
-class DecisionTrainingRecord(BaseModel):
+class DecisionRecord(BaseModel):
     record_id: str = Field(default_factory=lambda: uuid4().hex)
     thread_id: str
     suggestion_id: str
@@ -223,11 +403,18 @@ class DecisionTrainingRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class ApiEnvelope(BaseModel):
+class DecisionTrainingRecord(DecisionRecord):
+    """Deprecated alias retained for compatibility with older code paths."""
+
+
+T = TypeVar("T")
+
+
+class ApiEnvelope(BaseModel, Generic[T]):
     success: bool = True
     request_id: str
     thread_id: str | None = None
-    data: dict[str, Any] = Field(default_factory=dict)
+    data: T
     error: dict[str, Any] | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
 
@@ -237,6 +424,163 @@ class SendMessageRequest(BaseModel):
     user_id: str = "default-user"
 
 
+class ModeUpdateRequest(BaseModel):
+    mode: CourseMode
+    user_id: str = "default-user"
+
+
+class ConfirmStepRequest(BaseModel):
+    step_id: str
+    user_id: str = "default-user"
+    note: str | None = None
+
+
 class ReviewSubmitRequest(BaseModel):
     submitter_id: str = "default-user"
     review_actions: list[HumanReviewAction]
+
+
+class RegenerateRequest(BaseModel):
+    instruction: str
+    base_version: int | None = None
+
+
+class LLMProviderConfig(BaseModel):
+    provider: str
+    model: str
+    temperature: float = 0.2
+    api_base_env: str | None = None
+    api_key_env: str | None = None
+    base_url: str | None = None
+
+
+class DeepAgentsPlanRequest(BaseModel):
+    thread_id: str | None = None
+    prompt: str
+    include_thread_context: bool = True
+
+
+class DeepAgentsReviewRequest(BaseModel):
+    thread_id: str
+    artifact_version: int | None = None
+    prompt: str | None = None
+
+
+class DeepAgentsResearchRequest(BaseModel):
+    thread_id: str | None = None
+    prompt: str
+
+
+class DeepAgentsPlanBundle(BaseModel):
+    engine: str = "llm_fallback"
+    summary: str
+    steps: list[str] = Field(default_factory=list)
+    case_strategy: list[str] = Field(default_factory=list)
+    revision_focus: list[str] = Field(default_factory=list)
+
+
+class DeepAgentsReviewBundle(BaseModel):
+    engine: str = "llm_fallback"
+    summary: str
+    findings: list[str] = Field(default_factory=list)
+    revision_instructions: list[str] = Field(default_factory=list)
+
+
+class DeepAgentsResearchBundle(BaseModel):
+    engine: str = "llm_fallback"
+    summary: str
+    candidate_cases: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+
+
+class CreateThreadResponse(BaseModel):
+    thread: ThreadSummary
+
+
+class ThreadListResponse(BaseModel):
+    threads: list[ThreadSummary]
+
+
+class ThreadStateResponse(BaseModel):
+    state: ThreadState
+
+
+class ThreadDetailResponse(BaseModel):
+    thread: ThreadSummary
+    state: ThreadState
+
+
+class ThreadTimelineResponse(BaseModel):
+    timeline: list[TimelineEvent]
+
+
+class ThreadHistoryResponse(BaseModel):
+    history: list[ThreadHistoryEntry]
+
+
+class ThreadVersionsResponse(BaseModel):
+    versions: list[ArtifactVersionDetail]
+
+
+class ThreadFilesResponse(BaseModel):
+    files: list[SourceDocument]
+
+
+class ArtifactResponse(BaseModel):
+    artifact: DraftArtifact | ArtifactVersionDetail | None
+
+
+class ArtifactDiffResponse(BaseModel):
+    diff: str
+    version: int
+    prev_version: int
+
+
+class UploadFileResponse(BaseModel):
+    uploaded: bool = True
+    filename: str
+    category: UploadCategory
+
+
+class BooleanResultResponse(BaseModel):
+    deleted: bool | None = None
+    accepted: bool | None = None
+    submitted: bool | None = None
+    resumed: bool | None = None
+    paused: bool | None = None
+    retracted: bool | None = None
+    replaced: bool | None = None
+
+
+class ReviewBatchResponse(BaseModel):
+    review_batch: ReviewBatch
+
+
+class ReviewSubmitResponse(BaseModel):
+    submitted: bool = True
+    review_batch_id: str
+
+
+class DecisionRecordsResponse(BaseModel):
+    records: list[DecisionRecord]
+
+
+class DecisionModelStatusResponse(BaseModel):
+    status: dict[str, Any]
+
+
+class AuditEventsResponse(BaseModel):
+    events: list[AuditEvent]
+
+
+class DeepAgentsPlanEnvelope(BaseModel):
+    bundle: DeepAgentsPlanBundle
+
+
+class DeepAgentsReviewEnvelope(BaseModel):
+    bundle: DeepAgentsReviewBundle
+
+
+class DeepAgentsResearchEnvelope(BaseModel):
+    bundle: DeepAgentsResearchBundle
