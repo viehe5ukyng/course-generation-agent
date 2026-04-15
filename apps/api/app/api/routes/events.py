@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.deps import get_service
-from app.core.schemas import ApiEnvelope
+from app.core.schemas import ApiEnvelope, AuditEventsResponse
 from app.services.course_agent import CourseAgentService
 from app.storage.thread_store import ThreadNotFoundError
 
@@ -47,7 +47,7 @@ async def thread_stream(thread_id: str, service: CourseAgentService = Depends(ge
     return EventSourceResponse(event_generator())
 
 
-@router.get("/threads/{thread_id}/events")
+@router.get("/threads/{thread_id}/events", response_model=ApiEnvelope[AuditEventsResponse])
 async def list_events(thread_id: str, service: CourseAgentService = Depends(get_service)):
     try:
         await service.store.get_thread(thread_id)
@@ -56,5 +56,5 @@ async def list_events(thread_id: str, service: CourseAgentService = Depends(get_
             status_code=404,
             detail={"code": "thread_not_found", "message": f"Thread not found: {exc.thread_id}"},
         ) from exc
-    events = service.audit.list_events(thread_id)
+    events = await service.audit.list_events(thread_id)
     return envelope(thread_id=thread_id, data={"events": [event.model_dump(mode="json") for event in events]})

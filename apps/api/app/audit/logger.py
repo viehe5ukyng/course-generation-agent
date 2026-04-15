@@ -7,6 +7,7 @@ from collections import defaultdict
 from typing import Any
 
 from app.core.schemas import AuditEvent
+from app.storage.thread_store import ThreadStore
 
 
 class JsonFormatter(logging.Formatter):
@@ -53,13 +54,16 @@ class EventBroker:
 
 
 class AuditService:
-    def __init__(self, broker: EventBroker) -> None:
+    def __init__(self, broker: EventBroker, store: ThreadStore | None = None) -> None:
         self.logger = logging.getLogger("course-agent.audit")
         self._events: dict[str, list[AuditEvent]] = defaultdict(list)
         self._broker = broker
+        self._store = store
 
     async def record(self, event: AuditEvent) -> None:
         self._events[event.thread_id].append(event)
+        if self._store is not None:
+            await self._store.append_audit_event(event)
         self.logger.info(event.event_type, extra={"payload": event.model_dump(mode="json")})
         await self._broker.publish(
             event.thread_id,
@@ -70,5 +74,7 @@ class AuditService:
             },
         )
 
-    def list_events(self, thread_id: str) -> list[AuditEvent]:
+    async def list_events(self, thread_id: str) -> list[AuditEvent]:
+        if self._store is not None:
+            return await self._store.list_audit_events(thread_id)
         return self._events.get(thread_id, [])

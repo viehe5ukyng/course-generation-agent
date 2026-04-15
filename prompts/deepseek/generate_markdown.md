@@ -52,4 +52,5 @@
 已确认需求： {decision_summary}
 需求槽位： {slot_summary}
 资料摘要： {source_summary}
+必须遵守的约束： {constraint_summary}
 参考案例风格： {example_reference}

@@ -1,0 +1,17 @@
+default_provider: deepseek
+
+providers:
+  deepseek:
+    api_base_env: DEEPSEEK_BASE_URL
+    api_key_env: DEEPSEEK_API_KEY
+    base_url: https://api.deepseek.com
+
+profiles:
+  chat:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.4
+  review:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.1
