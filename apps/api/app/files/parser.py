@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import fitz
 from docx import Document
@@ -30,6 +31,9 @@ class DocumentParser:
             doc.metadata = {"path": str(path), "error": str(exc)}
         return doc
 
+    def extract_text(self, path: Path, mime_type: str) -> str:
+        return self._extract_text(path, mime_type)
+
     def _extract_text(self, path: Path, mime_type: str) -> str:
         suffix = path.suffix.lower()
         if suffix in {".txt", ".md"} or mime_type.startswith("text/"):
@@ -39,6 +43,8 @@ class DocumentParser:
         if suffix == ".docx":
             doc = Document(str(path))
             return "\n".join(p.text for p in doc.paragraphs)
+        if suffix == ".doc":
+            return self._extract_legacy_word_text(path)
         if suffix in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
             return self._ocr_image(path)
         raise ValueError(f"Unsupported file type: {suffix}")
@@ -62,6 +68,11 @@ class DocumentParser:
 
     def _ocr_image(self, path: Path) -> str:
         return self._ocr_bytes(path.read_bytes())
+
+    def _extract_legacy_word_text(self, path: Path) -> str:
+        command = ["/usr/bin/textutil", "-convert", "txt", "-stdout", str(path)]
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        return completed.stdout
 
     def _ocr_bytes(self, payload: bytes) -> str:
         engine = self._get_ocr_engine()

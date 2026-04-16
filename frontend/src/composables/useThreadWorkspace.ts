@@ -41,6 +41,7 @@ export function useThreadWorkspace() {
   const processing = ref(false);
   const booting = ref(false);
   const bootError = ref("");
+  const composerError = ref("");
   const reconnectNotice = ref("");
   const inputEl = ref<HTMLTextAreaElement | null>(null);
   const streamingMarkdown = ref("");
@@ -53,6 +54,7 @@ export function useThreadWorkspace() {
   const editingMessageId = ref<string | null>(null);
   const copiedMessageId = ref<string | null>(null);
   const openMenuThreadId = ref<string | null>(null);
+  const frameworkDropActive = ref(false);
   let refreshQueued = false;
 
   const { connect, disconnect } = useThreadStream();
@@ -99,6 +101,23 @@ export function useThreadWorkspace() {
     return target?.message_id ?? null;
   });
   const currentCourseMode = computed(() => threadState.value?.course_mode ?? "single");
+  const seriesGuidedRuntime = computed<Record<string, unknown> | null>(() => {
+    const runtime = threadState.value?.runtime as { series_guided?: Record<string, unknown> } | undefined;
+    return runtime?.series_guided ?? null;
+  });
+  const awaitingFrameworkUpload = computed(() => currentCourseMode.value === "series" && !!seriesGuidedRuntime.value?.awaiting_framework_input);
+  const awaitingOptionalSeriesSkip = computed(
+    () =>
+      currentCourseMode.value === "series"
+      && threadState.value?.status === "collecting_requirements"
+      && seriesGuidedRuntime.value?.current_question_id === "supplementary_info",
+  );
+  const awaitingGenerationConfirmation = computed(
+    () => currentCourseMode.value === "series" && !hasDraft.value && !!seriesGuidedRuntime.value?.awaiting_confirmation,
+  );
+  const canSendCurrentInput = computed(
+    () => !!content.value.trim() || awaitingOptionalSeriesSkip.value,
+  );
   const contentCreationSteps = computed(() => visibleWorkflowSteps.value.filter((s) => s.stage === "content_creation"));
   const statusLabel = computed(() => {
     if (runtimeStatus.value) return runtimeStatus.value;
@@ -141,6 +160,7 @@ export function useThreadWorkspace() {
     try {
       const { state } = await fetchThread(threadId.value);
       threadState.value = state;
+      if (!awaitingFrameworkUpload.value) frameworkDropActive.value = false;
       const { history } = await fetchThreadHistory(threadId.value);
       threadHistory.value = history;
       const { threads } = await fetchThreads();
@@ -169,6 +189,8 @@ export function useThreadWorkspace() {
     streamingMarkdown.value = "";
     streamingAssistant.value = "";
     streamingAssistantActive.value = false;
+    composerError.value = "";
+    frameworkDropActive.value = false;
     processing.value = false;
     runtimeStatus.value = "";
     reviewDraft.value = {};
@@ -184,6 +206,23 @@ export function useThreadWorkspace() {
         const data = JSON.parse(event.data) as { content: string };
         streamingAssistantActive.value = true;
         streamingAssistant.value += data.content;
+        scrollBottom();
+      } else if (type === "assistant_message") {
+        const data = JSON.parse(event.data) as { content?: string };
+        const content = data.content ?? "";
+        if (content === "已经生成好框架。") {
+          processing.value = true;
+          runtimeStatus.value = "已经生成好框架";
+        } else if (content === "正在评分...") {
+          processing.value = true;
+          runtimeStatus.value = "正在评分";
+        } else {
+          processing.value = false;
+          runtimeStatus.value = "";
+        }
+        streamingAssistant.value = "";
+        streamingAssistantActive.value = false;
+        await refreshThread();
         scrollBottom();
       } else if (type === "assistant_stream_end") {
         processing.value = false;
@@ -263,9 +302,12 @@ export function useThreadWorkspace() {
   }
 
   async function handleSend() {
-    const text = content.value.trim();
-    if (!text || sending.value || processing.value || isPaused.value) return;
+    const rawText = content.value;
+    const text = rawText.trim();
+    if ((!text && !awaitingOptionalSeriesSkip.value) || sending.value || processing.value || isPaused.value) return;
+    const payload = !text && awaitingOptionalSeriesSkip.value ? "" : text;
     sending.value = true;
+    composerError.value = "";
     content.value = "";
     autoResize();
     try {
@@ -274,21 +316,21 @@ export function useThreadWorkspace() {
         await connectThread(thread.thread_id);
       }
       if (editingMessageId.value) {
-        await replaceLastMessage(threadId.value, text);
+        await replaceLastMessage(threadId.value, payload);
         editingMessageId.value = null;
       } else {
-        await sendMessage(threadId.value, text);
+        await sendMessage(threadId.value, payload);
       }
       processing.value = true;
       scrollBottom();
     } catch (err) {
       if (isThreadNotFound(err)) {
         await recreateThreadAndReconnect();
-        await sendMessage(threadId.value, text);
+        await sendMessage(threadId.value, payload);
         processing.value = true;
         scrollBottom();
       } else {
-        content.value = text;
+        content.value = rawText;
         console.error(err);
       }
     } finally {
@@ -309,6 +351,28 @@ export function useThreadWorkspace() {
       await refreshThread();
     } catch (err) {
       console.error(err);
+    }
+  }
+
+  async function handleStartGeneration() {
+    if (!threadId.value || sending.value || processing.value || isPaused.value) return;
+    sending.value = true;
+    composerError.value = "";
+    try {
+      await sendMessage(threadId.value, "开始生成");
+      processing.value = true;
+      scrollBottom();
+    } catch (err) {
+      if (isThreadNotFound(err)) {
+        await recreateThreadAndReconnect();
+        await sendMessage(threadId.value, "开始生成");
+        processing.value = true;
+        scrollBottom();
+      } else {
+        console.error(err);
+      }
+    } finally {
+      sending.value = false;
     }
   }
 
@@ -416,6 +480,7 @@ export function useThreadWorkspace() {
     clearActiveThread();
     content.value = "";
     editingMessageId.value = null;
+    composerError.value = "";
     nextTick(() => inputEl.value?.focus());
   }
 
@@ -444,6 +509,7 @@ export function useThreadWorkspace() {
     if (!tid || tid === threadId.value) return;
     reconnectNotice.value = "";
     runtimeStatus.value = "";
+    composerError.value = "";
     await connectThread(tid);
   }
 
@@ -456,16 +522,58 @@ export function useThreadWorkspace() {
     await refreshThread();
   }
 
-  async function handleUpload(category: "context" | "package", fileList: FileList | null) {
+  async function handleUpload(category: "context" | "package" | "framework", fileList: FileList | null) {
     if (!fileList?.length) return;
+    composerError.value = "";
     if (!threadId.value) {
       const { thread } = await createThread();
       await connectThread(thread.thread_id);
     }
-    for (const file of Array.from(fileList)) {
-      await uploadThreadFile(threadId.value, file, category);
+    if (category === "framework") {
+      frameworkDropActive.value = false;
+      processing.value = true;
+      runtimeStatus.value = "正在导入现成框架";
     }
-    await refreshThread();
+    try {
+      for (const file of Array.from(fileList)) {
+        await uploadThreadFile(threadId.value, file, category);
+      }
+      await refreshThread();
+    } catch (err) {
+      processing.value = false;
+      runtimeStatus.value = "";
+      if (isThreadNotFound(err)) {
+        await recreateThreadAndReconnect();
+      } else if (err instanceof ApiError) {
+        const detail = err.detail as { detail?: { message?: string } } | null;
+        composerError.value = detail?.detail?.message ?? "上传失败，请重试。";
+      } else {
+        composerError.value = "上传失败，请重试。";
+        console.error(err);
+      }
+    }
+  }
+
+  function handleFrameworkDragOver(event: DragEvent) {
+    if (!awaitingFrameworkUpload.value) return;
+    event.preventDefault();
+    frameworkDropActive.value = true;
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleFrameworkDragLeave(event: DragEvent) {
+    if (!awaitingFrameworkUpload.value) return;
+    const current = event.currentTarget;
+    const next = event.relatedTarget;
+    if (current instanceof HTMLElement && next instanceof Node && current.contains(next)) return;
+    frameworkDropActive.value = false;
+  }
+
+  function handleFrameworkDrop(event: DragEvent) {
+    if (!awaitingFrameworkUpload.value) return;
+    event.preventDefault();
+    frameworkDropActive.value = false;
+    void handleUpload("framework", event.dataTransfer?.files ?? null);
   }
 
   function toggleThreadMenu(id: string, event: MouseEvent) {
@@ -504,6 +612,7 @@ export function useThreadWorkspace() {
     processing,
     booting,
     bootError,
+    composerError,
     reconnectNotice,
     inputEl,
     streamingAssistant,
@@ -514,6 +623,7 @@ export function useThreadWorkspace() {
     editingMessageId,
     copiedMessageId,
     openMenuThreadId,
+    frameworkDropActive,
     workspaceModeOptions,
     messages,
     visibleMessages,
@@ -532,6 +642,10 @@ export function useThreadWorkspace() {
     canRetract,
     editableUserMessageId,
     currentCourseMode,
+    awaitingFrameworkUpload,
+    awaitingOptionalSeriesSkip,
+    awaitingGenerationConfirmation,
+    canSendCurrentInput,
     contentCreationSteps,
     statusLabel,
     autoResize,
@@ -539,6 +653,10 @@ export function useThreadWorkspace() {
     selectThread,
     selectWorkspaceMode,
     handleUpload,
+    handleFrameworkDragOver,
+    handleFrameworkDragLeave,
+    handleFrameworkDrop,
+    handleStartGeneration,
     handleSend,
     handlePauseResume,
     handleDeleteThread,

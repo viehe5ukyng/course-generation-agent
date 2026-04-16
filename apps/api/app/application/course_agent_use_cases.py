@@ -28,6 +28,7 @@ from app.core.schemas import (
     ReviewSubmitRequest,
     ReviewSuggestion,
     SavedArtifactRecord,
+    SeriesGuidedRuntimeState,
     StepStatus,
     ThreadHistoryEntry,
     ThreadStatus,
@@ -39,8 +40,28 @@ from app.core.schemas import (
 )
 from app.files.parser import DocumentParser
 from app.review.rubric import RUBRIC
+from app.series.decision_scoring import PASS_THRESHOLD as SERIES_PASS_THRESHOLD
+from app.series.decision_scoring import format_series_review_report_markdown, score_series_framework_markdown
+from app.series.scoring import parse_framework_markdown
 from app.storage.thread_store import ThreadStore
 from app.workflows.course_graph import CourseGraph
+
+SERIES_STARTER_PROMPT = (
+    "请选择使用方式：\n\n"
+    "A. 我没有框架，直接开始制课\n\n"
+    "B. 我有现成的框架，直接评分并优化\n\n"
+    "请输入 A 或 B："
+)
+
+
+def series_framework_to_user_input(framework) -> str:
+    return (
+        "我已经有一版课程框架，需要基于它继续优化。"
+        f"课程名称：{framework.course_name}。"
+        f"目标学员：{framework.target_user}。"
+        f"课程核心问题：{framework.core_problem}。"
+        f"应用场景：{framework.application_scenario}。"
+    )
 
 
 @dataclass
@@ -162,16 +183,30 @@ class ThreadUseCases:
 
     async def update_mode(self, thread_id: str, request: ModeUpdateRequest):
         state = await self.support.store.get_thread(thread_id)
+        starter_message: MessageRecord | None = None
         state.course_mode = request.mode
         state.workflow_steps = self.support.build_workflow_steps(request.mode)
         state.current_step_id = state.workflow_steps[0].step_id if state.workflow_steps else "course_title"
+        state.requirements_confirmed = False
+        state.requirement_slots = {}
+        state.decision_ledger = []
+        state.decision_summary = ""
         state.draft_artifact = None
         state.review_batches = []
         state.approved_feedback = []
         state.runtime.generation_session = None
         state.runtime.pending_manual_revision_request = None
+        state.runtime.series_guided = SeriesGuidedRuntimeState(awaiting_entry_mode=request.mode == CourseMode.SERIES)
+        if request.mode == CourseMode.SERIES and not state.messages:
+            starter_message = MessageRecord(role=MessageRole.ASSISTANT, content=SERIES_STARTER_PROMPT)
+            state.messages.append(starter_message)
         await self.support.store.save_thread(state)
         await self.support.record_timeline(thread_id, "mode_changed", "切换了制课模式", detail=request.mode.value)
+        if starter_message is not None:
+            await self.support.broker.publish(
+                thread_id,
+                {"type": "assistant_message", "thread_id": thread_id, "payload": {"content": starter_message.content}},
+            )
         return state
 
     async def list_threads(self):
@@ -319,7 +354,12 @@ class ArtifactUseCases:
         return artifact
 
     async def upload_file(self, thread_id: str, filename: str, mime_type: str, content: bytes, category: UploadCategory = UploadCategory.CONTEXT) -> None:
-        bucket_dir = "package_uploads" if category == UploadCategory.PACKAGE else "context_uploads"
+        if category == UploadCategory.PACKAGE:
+            bucket_dir = "package_uploads"
+        elif category == UploadCategory.FRAMEWORK:
+            bucket_dir = "framework_uploads"
+        else:
+            bucket_dir = "context_uploads"
         path = self.settings.storage_dir / thread_id / bucket_dir
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / filename
@@ -327,11 +367,34 @@ class ArtifactUseCases:
         doc = self.support.parser.parse_file(file_path, mime_type)
         doc.metadata["category"] = category.value
         state = await self.support.store.get_thread(thread_id)
+        if category == UploadCategory.FRAMEWORK:
+            if state.course_mode != CourseMode.SERIES:
+                raise ValueError("只有系列课支持导入现成框架。")
+            framework_text = "\n".join(chunk.text for chunk in doc.text_chunks).strip()
+            if doc.extract_status != "parsed" or not framework_text:
+                raise ValueError("现成框架文件解析失败，请上传可读取的 .md、.docx 或 .doc 文件。")
+            framework = parse_framework_markdown(framework_text)
+            if not framework.course_name or not framework.lessons:
+                raise ValueError("现成框架解析失败，请上传符合 series_framework.md 风格的框架文件。")
+            guided = state.runtime.series_guided
+            guided.entry_mode = "B"
+            guided.awaiting_entry_mode = False
+            guided.awaiting_initial_idea = False
+            guided.awaiting_framework_input = False
+            guided.awaiting_confirmation = False
+            guided.completed = True
+            guided.using_existing_framework = True
+            guided.imported_framework_markdown = framework_text
+            guided.initial_user_input = series_framework_to_user_input(framework)
+            guided.current_question_id = None
+            guided.current_question_prompt = None
+            state.runtime.clarification.is_confirmation_reply = True
+            state.messages.append(MessageRecord(role=MessageRole.USER, content=f"我导入了现成框架文件：{filename}"))
         state.source_manifest.append(doc)
         state.saved_artifacts.append(
             SavedArtifactRecord(
                 step_id="package_upload" if category == UploadCategory.PACKAGE else state.current_step_id,
-                label=filename,
+                label=f"现成框架：{filename}" if category == UploadCategory.FRAMEWORK else filename,
                 filename=filename,
                 path=str(file_path),
                 kind="uploaded" if category == UploadCategory.PACKAGE else "reference",
@@ -383,14 +446,25 @@ class ArtifactUseCases:
                 continue
             if action.edited_suggestion:
                 instructions.append(action.edited_suggestion)
-        markdown = await self.support.graph.deepseek.improve_markdown(
-            markdown=base_artifact.markdown,
-            approved_changes=instructions,
-            context_summary=state.decision_summary,
-            constraint_summary=self.support.constraint_summary(state),
-            source_version=base_artifact.version,
-            revision_goal=request.instruction,
-        )
+        if state.course_mode == CourseMode.SERIES:
+            markdown = await self.support.graph.deepseek.rewrite_series_framework_markdown(
+                markdown=base_artifact.markdown,
+                user_input=state.runtime.series_guided.initial_user_input or next((m.content for m in state.messages if m.role == MessageRole.USER), ""),
+                guided_answers=self.support.graph._series_guided_answers_text(state),
+                approved_changes=instructions,
+                constraint_summary=self.support.constraint_summary(state),
+                source_version=base_artifact.version,
+                revision_goal=request.instruction,
+            )
+        else:
+            markdown = await self.support.graph.deepseek.improve_markdown(
+                markdown=base_artifact.markdown,
+                approved_changes=instructions,
+                context_summary=state.decision_summary,
+                constraint_summary=self.support.constraint_summary(state),
+                source_version=base_artifact.version,
+                revision_goal=request.instruction,
+            )
         next_version = max([item.version for item in await self.support.store.list_versions(thread_id)], default=0) + 1
         artifact = DraftArtifact(
             version=next_version,
@@ -417,18 +491,51 @@ class ArtifactUseCases:
             )
         )
         await self.support.store.upsert_artifact_version(thread_id, artifact)
-        review_result = await self.support.graph.deepseek.review_markdown(markdown=artifact.markdown, rubric=RUBRIC, threshold=self.settings.default_review_threshold)
+        review_message = ""
+        review_threshold = self.settings.default_review_threshold
+        if state.course_mode == CourseMode.SERIES:
+            report = await score_series_framework_markdown(artifact.markdown, self.support.graph.deepseek)
+            review_result = {
+                "total_score": report.total_score,
+                "criteria": [
+                    {
+                        "criterion_id": item.criterion_id,
+                        "name": item.name,
+                        "weight": item.weight,
+                        "score": item.score,
+                        "max_score": item.max_score,
+                        "reason": item.reason,
+                    }
+                    for item in report.criteria
+                ],
+                "suggestions": [
+                    {
+                        "criterion_id": item.criterion_id,
+                        "problem": item.problem,
+                        "suggestion": item.suggestion,
+                        "evidence_span": item.evidence_span,
+                        "severity": item.severity,
+                    }
+                    for item in report.suggestions
+                ],
+            }
+            review_threshold = SERIES_PASS_THRESHOLD
+            review_message = format_series_review_report_markdown(report)
+        else:
+            review_result = await self.support.graph.deepseek.review_markdown(markdown=artifact.markdown, rubric=RUBRIC, threshold=self.settings.default_review_threshold)
         batch = ReviewBatch(
             step_id=state.current_step_id,
             draft_version=artifact.version,
             total_score=float(review_result["total_score"]),
             criteria=[ReviewCriterionResult.model_validate(item) for item in review_result["criteria"]],
             suggestions=[ReviewSuggestion.model_validate(item) for item in review_result["suggestions"]],
-            threshold=self.settings.default_review_threshold,
+            threshold=review_threshold,
         )
         state.review_batches.append(batch)
         await self.support.store.append_review_batch(thread_id, batch)
         state.status = ThreadStatus.REVIEW_PENDING
+        if review_message:
+            state.messages.append(MessageRecord(role=MessageRole.ASSISTANT, content=review_message))
         await self.support.store.save_thread(state)
         await self.support.record_timeline(
             thread_id,
@@ -438,6 +545,8 @@ class ArtifactUseCases:
         )
         await self.support.broker.publish(thread_id, {"type": "artifact_updated", "thread_id": thread_id, "payload": artifact.model_dump(mode="json")})
         await self.support.broker.publish(thread_id, {"type": "review_ready", "thread_id": thread_id, "payload": batch.model_dump(mode="json")})
+        if review_message:
+            await self.support.broker.publish(thread_id, {"type": "assistant_message", "thread_id": thread_id, "payload": {"content": review_message}})
         await self.support.broker.publish(
             thread_id,
             {"type": "revision_completed", "thread_id": thread_id, "payload": {"version": artifact.version, "review_batch_id": batch.review_batch_id}},

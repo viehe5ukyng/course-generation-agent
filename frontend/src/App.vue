@@ -6,7 +6,6 @@ import WorkspaceShell from "./components/workspace/WorkspaceShell.vue";
 import ThreadSidebar from "./components/workspace/ThreadSidebar.vue";
 import MessageList from "./components/workspace/MessageList.vue";
 import ArtifactPanel from "./components/workspace/ArtifactPanel.vue";
-import ReviewPanel from "./components/workspace/ReviewPanel.vue";
 import { useThreadWorkspace } from "./composables/useThreadWorkspace";
 
 const starterChips = [
@@ -64,7 +63,7 @@ function bindInputEl(el: Element | ComponentPublicInstance | null) {
               @keydown="workspace.handleKeydown"
               @input="workspace.autoResize"
             />
-            <input id="landing-context-upload" class="hidden-input" type="file" multiple @change="workspace.handleUpload('context', ($event.target as HTMLInputElement).files)" />
+            <input id="landing-context-upload" class="hidden-input" type="file" multiple @change="workspace.handleUpload('context', ($event.target as HTMLInputElement).files); ($event.target as HTMLInputElement).value = ''" />
             <div class="composer-bar">
               <label class="attach-btn" for="landing-context-upload" aria-label="添加文件">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
@@ -132,28 +131,60 @@ function bindInputEl(el: Element | ComponentPublicInstance | null) {
       />
 
       <div class="composer-wrap">
-        <div class="chat-composer">
+        <div
+          class="chat-composer"
+          :class="{ 'framework-mode': workspace.awaitingFrameworkUpload, 'framework-drop-active': workspace.frameworkDropActive }"
+          @dragover="workspace.handleFrameworkDragOver"
+          @dragleave="workspace.handleFrameworkDragLeave"
+          @drop="workspace.handleFrameworkDrop"
+        >
+          <input
+            id="chat-framework-upload"
+            class="hidden-input"
+            type="file"
+            accept=".md,.docx,.doc"
+            @change="workspace.handleUpload('framework', ($event.target as HTMLInputElement).files); ($event.target as HTMLInputElement).value = ''"
+          />
+          <div v-if="workspace.awaitingFrameworkUpload" class="framework-entry-card">
+            <div class="framework-entry-copy">
+              <span class="framework-entry-kicker">现成框架导入</span>
+              <strong>把 `.md`、`.docx`、`.doc` 拖到这里</strong>
+              <p>也可以点按钮上传。上传后会直接进入评分和优化，不会走素材包入口。</p>
+            </div>
+            <label class="framework-upload-btn" for="chat-framework-upload">上传本地框架</label>
+          </div>
           <textarea
             :ref="bindInputEl"
             v-model="workspace.content"
             class="composer-textarea"
             rows="1"
             :disabled="workspace.booting || (workspace.processing && !workspace.isPaused)"
-            placeholder="继续补充需求，或说你想修改什么…"
+            :placeholder="workspace.awaitingFrameworkUpload ? '也可以直接粘贴你的课程框架全文…' : (workspace.awaitingOptionalSeriesSkip ? '这一题可直接回车跳过…' : '继续补充需求，或说你想修改什么…')"
             @keydown="workspace.handleKeydown"
             @input="workspace.autoResize"
           />
-          <input id="chat-context-upload" class="hidden-input" type="file" multiple @change="workspace.handleUpload('context', ($event.target as HTMLInputElement).files)" />
+          <input id="chat-context-upload" class="hidden-input" type="file" multiple @change="workspace.handleUpload('context', ($event.target as HTMLInputElement).files); ($event.target as HTMLInputElement).value = ''" />
           <div class="composer-bar">
+            <label v-if="workspace.awaitingFrameworkUpload" class="attach-btn framework-attach-btn" for="chat-framework-upload" aria-label="上传现成框架">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M5 19h14"/></svg>
+            </label>
             <label class="attach-btn" for="chat-context-upload" aria-label="添加文件">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
             </label>
             <div class="composer-actions">
+              <button
+                v-if="workspace.awaitingGenerationConfirmation"
+                class="start-generate-btn"
+                :disabled="workspace.sending || workspace.booting || workspace.processing"
+                @click="workspace.handleStartGeneration"
+              >
+                开始生成
+              </button>
               <button v-if="workspace.canRetract" class="ghost-btn" @click="workspace.retractMessage">撤回</button>
               <button
                 class="send-btn"
                 :class="{ paused: workspace.processing || workspace.isPaused }"
-                :disabled="(!workspace.content.trim() && !workspace.processing && !workspace.isPaused) || workspace.sending || workspace.booting"
+                :disabled="(!workspace.canSendCurrentInput && !workspace.processing && !workspace.isPaused) || workspace.sending || workspace.booting"
                 :aria-label="workspace.processing || workspace.isPaused ? (workspace.isPaused ? '继续' : '暂停') : '发送'"
                 @click="workspace.processing || workspace.isPaused ? workspace.handlePauseResume() : workspace.handleSend()"
               >
@@ -164,6 +195,7 @@ function bindInputEl(el: Element | ComponentPublicInstance | null) {
             </div>
           </div>
         </div>
+        <p v-if="workspace.composerError" class="composer-error">{{ workspace.composerError }}</p>
         <p class="disclaimer">制课 Agent 可能会犯错，请核实重要内容。</p>
       </div>
     </template>
@@ -178,14 +210,6 @@ function bindInputEl(el: Element | ComponentPublicInstance | null) {
           @click-step="workspace.clickStep"
           @open-artifact="workspace.artifactViewer.openFileViewer"
           @upload="workspace.handleUpload"
-        />
-        <div class="rp-divider" />
-        <ReviewPanel
-          :latest-review="workspace.latestReview"
-          :review-draft="workspace.reviewDraft"
-          @set-action="workspace.setAction"
-          @update-edited="workspace.updateEditedSuggestion"
-          @submit="workspace.handleReviewSubmit"
         />
       </template>
     </template>
@@ -801,8 +825,83 @@ html, body, #app {
   box-shadow: var(--ivory) 0 0 0 0, var(--ring-1) 0 0 0 1px, rgba(0,0,0,.04) 0 4px 20px;
   transition: box-shadow .18s;
 }
+.chat-composer.framework-mode {
+  background:
+    linear-gradient(180deg, rgba(201,100,66,.055) 0%, rgba(255,255,255,0) 120px),
+    var(--ivory);
+}
+.chat-composer.framework-drop-active {
+  box-shadow: var(--ivory) 0 0 0 0, var(--terracotta) 0 0 0 1.5px, rgba(201,100,66,.18) 0 16px 36px;
+}
 .chat-composer:focus-within {
   box-shadow: var(--ivory) 0 0 0 0, var(--focus-blue) 0 0 0 1.5px, rgba(0,0,0,.06) 0 8px 28px;
+}
+.framework-entry-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  border: 1px dashed var(--terracotta-border); border-radius: 14px;
+  background: linear-gradient(135deg, rgba(201,100,66,.08), rgba(255,255,255,.85));
+  padding: 14px 15px;
+  margin-bottom: 12px;
+  transition: border-color .14s, transform .14s, background .14s;
+}
+.framework-drop-active .framework-entry-card {
+  border-color: var(--terracotta);
+  background: linear-gradient(135deg, rgba(201,100,66,.16), rgba(255,255,255,.92));
+  transform: translateY(-1px);
+}
+.framework-entry-copy {
+  display: flex; flex-direction: column; gap: 3px;
+  min-width: 0;
+}
+.framework-entry-kicker {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--terracotta);
+}
+.framework-entry-copy strong {
+  font-size: 16px; font-weight: 600; color: var(--text-1);
+}
+.framework-entry-copy p {
+  font-size: 12.5px; line-height: 1.6; color: var(--text-2);
+}
+.framework-upload-btn {
+  flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 36px; padding: 0 15px;
+  border-radius: 999px; border: 1px solid var(--terracotta-border);
+  background: var(--white); color: var(--terracotta);
+  font-size: 12.5px; font-weight: 600; cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.framework-upload-btn:hover {
+  background: var(--terracotta);
+  border-color: var(--terracotta);
+  color: var(--ivory);
+}
+.framework-attach-btn {
+  border-color: var(--terracotta-border);
+  color: var(--terracotta);
+}
+.framework-attach-btn:hover {
+  background: var(--terracotta-bg);
+  color: var(--terracotta);
+}
+.start-generate-btn {
+  height: 28px; border: 1px solid var(--terracotta); border-radius: 999px;
+  background: var(--terracotta); padding: 0 13px;
+  font-size: 12.5px; font-family: var(--font-sans); font-weight: 600;
+  color: var(--ivory); cursor: pointer;
+  transition: background .12s, border-color .12s, transform .08s;
+}
+.start-generate-btn:hover:not(:disabled) {
+  background: var(--terracotta-hover);
+  border-color: var(--terracotta-hover);
+}
+.start-generate-btn:active:not(:disabled) { transform: translateY(1px); }
+.start-generate-btn:disabled {
+  background: var(--warm-sand);
+  border-color: var(--border-warm);
+  color: var(--text-3);
+  cursor: not-allowed;
 }
 .ghost-btn {
   height: 28px; border: 1px solid var(--border-warm); border-radius: var(--r-sm);
@@ -811,6 +910,12 @@ html, body, #app {
   transition: background .12s, color .12s;
 }
 .ghost-btn:hover { background: var(--warm-sand); color: var(--text-1); }
+.composer-error {
+  max-width: 820px; margin: 8px auto 0;
+  font-size: 12.5px; color: var(--danger);
+  background: var(--danger-bg); border: 1px solid var(--danger-border);
+  border-radius: var(--r-md); padding: 8px 12px;
+}
 .disclaimer {
   max-width: 820px; margin: 6px auto 0;
   text-align: center; font-size: 11px; color: var(--text-3);

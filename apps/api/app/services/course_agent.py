@@ -90,6 +90,11 @@ class CourseAgentService:
 
     async def upload_file(self, thread_id: str, filename: str, mime_type: str, content: bytes, category: UploadCategory = UploadCategory.CONTEXT) -> None:
         await self.artifacts.upload_file(thread_id, filename, mime_type, content, category)
+        if category == UploadCategory.FRAMEWORK:
+            if self.settings.app_env == "test":
+                await self.graph.run_thread(thread_id)
+            else:
+                self._spawn_thread_task(thread_id, self.graph.run_thread(thread_id))
 
     async def retract_last_message(self, thread_id: str) -> None:
         await self.conversation.retract_last_message(thread_id)

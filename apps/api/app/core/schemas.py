@@ -67,6 +67,7 @@ class StepStatus(str, Enum):
 class UploadCategory(str, Enum):
     CONTEXT = "context"
     PACKAGE = "package"
+    FRAMEWORK = "framework"
 
 
 class GenerationRunKind(str, Enum):
@@ -243,6 +244,31 @@ class ClarificationRuntimeState(BaseModel):
     is_confirmation_reply: bool = False
 
 
+class SeriesGuidedAnswer(BaseModel):
+    step_id: str
+    question_title: str
+    selected_key: str
+    selected_label: str
+    final_answer: str
+    custom_input: str | None = None
+
+
+class SeriesGuidedRuntimeState(BaseModel):
+    entry_mode: str | None = None
+    awaiting_entry_mode: bool = False
+    awaiting_initial_idea: bool = False
+    awaiting_framework_input: bool = False
+    using_existing_framework: bool = False
+    imported_framework_markdown: str | None = None
+    initial_user_input: str = ""
+    next_question_index: int = 0
+    current_question_id: str | None = None
+    current_question_prompt: str | None = None
+    awaiting_confirmation: bool = False
+    completed: bool = False
+    answers: dict[str, SeriesGuidedAnswer] = Field(default_factory=dict)
+
+
 class GenerationSessionState(BaseModel):
     session_id: str = Field(default_factory=lambda: uuid4().hex)
     step_id: str | None = None
@@ -271,6 +297,7 @@ class PauseRuntimeState(BaseModel):
 
 class ThreadRuntimeState(BaseModel):
     clarification: ClarificationRuntimeState = Field(default_factory=ClarificationRuntimeState)
+    series_guided: SeriesGuidedRuntimeState = Field(default_factory=SeriesGuidedRuntimeState)
     generation_session: GenerationSessionState | None = None
     pending_manual_revision_request: str | None = None
     pause: PauseRuntimeState = Field(default_factory=PauseRuntimeState)

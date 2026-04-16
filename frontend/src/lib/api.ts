@@ -243,7 +243,7 @@ export async function replaceLastMessage(threadId: string, content: string) {
   ) as BooleanResultResponse;
 }
 
-export async function uploadThreadFile(threadId: string, file: File, category: "context" | "package") {
+export async function uploadThreadFile(threadId: string, file: File, category: "context" | "package" | "framework") {
   const form = new FormData();
   form.append("file", file);
   const response = await fetch(`${API_BASE}/api/v1/threads/${threadId}/files?category=${category}`, {
